@@ -10,6 +10,9 @@ interface Comparable {
   hourly: Point[];
 }
 interface Case {
+  game?: { name: string };
+  notes?: string;
+  platforms?: string;
   day_start: string;
   known: Array<{ hour: number; viewers: number }>;
   history_hourly?: Point[];
@@ -23,26 +26,29 @@ interface Launch {
 const HOUR = 3600000;
 const Z = [-1.6448536269514722, -0.6744897501960817, 0,
   0.6744897501960817, 1.6448536269514722];
-// Calibrated by leave-one-out evaluation over the kit's comparables so the 90% interval is honest.
-const SIGMA_SCALE = 1.2;
+// Coarse, launch-level LOO calibration on the 37 complete launch days in the kit.
+// Mean contest loss: 0.812028 before, 0.379689 after; nested five-fold: 0.403451.
+// No launch-specific parameters, fitted hourly offsets, or practice answers.
+const SHAPE_SCALE = 1.1;
+const SIGMA_SCALE = 0.65;
 const clamp = (x: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, x));
 
-// A launch is an observation, not each of its hundreds of prelaunch rows.
-// Exclude premieres, early access, and global PC unlocks. Give the strongest
-// weight to console-only releases, including ones with unverified unlock notes.
-function relevance(c: Comparable): number {
-  const text = c.unlock.toLowerCase();
-  if (/target-history|not a launch|tier: weak|early-access-contaminated/.test(text)) return 0;
-  const consoleOnly = !/\bpc\b|steam|stadia/i.test(c.platforms);
-  if (consoleOnly) return 1;
-  if (/weak analogue|live-service|multiplayer|free-to-play/.test(text)) return 0;
-  if (!/midnight local|rolling/.test(text)) return 0;
-  return 0.15;
+// Release metadata only: discard retrospective research commentary. Unknown
+// launches borrow across regimes instead of being silently excluded from scoring.
+function regime(notes: string, platforms = ''): number {
+  const text = notes.toLowerCase().split('research note:')[0].replace(/no early access/g, '');
+  if (/early access|early-access|early 20|premium|deluxe|multiplayer beta/.test(text)) return 0;
+  if (/single.*global|simultaneous|pc only|pc single/.test(text)
+    && !/consoles midnight|midnight local/.test(text)) return 2;
+  if (!/\bpc\b|steam|stadia/i.test(platforms) || /midnight local|rolling/.test(text)) return 1;
+  return 3;
 }
 
 function launches(c: Case): Launch[] {
   const result: Launch[] = [];
   const checkpoint = c.known.find(row => row.hour === 1)?.viewers ?? 1;
+  // GTA VI and the practice console releases have rolling local-midnight unlocks.
+  const targetRegime = regime(c.notes ?? 'midnight local rolling', c.platforms ?? '');
   const targetStart = Date.parse(c.day_start);
   const target = new Map<number, number>();
   for (const row of c.history_hourly ?? []) {
@@ -52,8 +58,7 @@ function launches(c: Case): Launch[] {
     }
   }
   for (const comp of c.comparables ?? []) {
-    let weight = relevance(comp);
-    if (!weight) continue;
+    if (/target-history|not a launch/i.test(comp.unlock)) continue;
     const start = Date.parse(comp.day_start);
     const values = new Map<number, number>();
     for (const row of comp.hourly) {
@@ -64,18 +69,21 @@ function launches(c: Case): Launch[] {
     }
     const first = values.get(0);
     if (!first || first < 100 || Array.from({ length: 24 }, (_, h) => values.has(h)).filter(Boolean).length < 18) continue;
-    // Compare only information available before the forecast checkpoint.
-    // Tighter pre-launch similarity weighting, leave-one-out calibrated.
+    // Broad Gaussian pooling on information available at the checkpoint. The
+    // log-size kernel distinguishes a pre-unlock trickle from an established
+    // audience without using the held-out launch's eventual peak or curve.
+    let weight = Math.exp(-0.5 * Math.log(Math.max(1, checkpoint) / first) ** 2)
+      * (targetRegime === regime(comp.unlock, comp.platforms) ? 1 : 0.5);
     let distance = 0;
     let observed = 0;
-    for (const t of [-1, -2, -4, -8, -12]) {
+    for (const t of [-1, -2, -4, -8, -12, -24]) {
       const a = target.get(t);
       const b = values.get(t);
       if (a === undefined || b === undefined) continue;
-      distance += Math.min(4, (a - Math.log(b / first)) ** 2);
+      distance += Math.min(9, (a - Math.log(b / first)) ** 2);
       observed++;
     }
-    if (observed) weight *= 0.2 + 0.8 * Math.exp(-distance / observed / (2 * 0.4 ** 2));
+    if (observed) weight *= Math.exp(-distance / observed / (2 * 2 ** 2));
     const curve = Array.from({ length: 24 }, (_, h) => {
       const v = values.get(h);
       return v === undefined ? null : Math.log(v / first);
@@ -96,7 +104,7 @@ export function forecast(c: Case): { hours: Array<{ hour: number; q: number[] }>
     const rows = samples.filter(s => s.curve[h] !== null);
     const w = rows.reduce((sum, s) => sum + s.weight, 0);
     const w2 = rows.reduce((sum, s) => sum + s.weight ** 2, 0);
-    if (rows.length < 2 || w === 0) {
+    if (rows.length < 2 || w <= 1e-100 || w - w2 / w <= 1e-100) {
       means[h] = 0;
       variances[h] = 0.15 ** 2 * h;
       continue;
@@ -113,16 +121,62 @@ export function forecast(c: Case): { hours: Array<{ hour: number; q: number[] }>
     // Mild local pooling stabilizes variance without erasing unlock jumps.
     const variance = 0.6 * variances[h] + 0.2 * variances[Math.max(1, h - 1)]
       + 0.2 * variances[Math.min(23, h + 1)];
-    const sigma = Math.sqrt(Math.max(0.03 ** 2, variance)) * SIGMA_SCALE;
-    return { hour: h + 1, q: Z.map(z => Math.exp(clamp(anchor + means[h] + z * sigma, Math.log(0.01), Math.log(1e9)))) };
+    // Smooth the ramp, retaining the donors' unlock-peak timing. Coarse tests
+    // of additional 6 UTC bumps and 0/0.5/1-hour DST alignment selected zero.
+    const mean = SHAPE_SCALE * 0.5 * (means[Math.max(0, h - 1)] + means[Math.min(23, h + 1)]);
+    // Shrink noisy empirical variance and add a smooth residual floor that
+    // grows away from the known checkpoint, rather than 23 fitted spreads.
+    const sigma = Math.sqrt(Math.max(0.03 ** 2,
+      SIGMA_SCALE ** 2 * variance + 0.3 ** 2 * (1 - Math.exp(-h / 6))));
+    return { hour: h + 1, q: Z.map(z => Math.exp(clamp(anchor + mean + z * sigma, Math.log(0.01), Math.log(1e9)))) };
   });
   return { hours };
 }
 
 const inputDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-mkdirSync(outputDir, { recursive: true });
-for (const file of readdirSync(inputDir).filter(name => name.endsWith('.in')).sort()) {
-  const c = JSON.parse(readFileSync(join(inputDir, file), 'utf8')) as Case;
-  writeFileSync(join(outputDir, `${file.slice(0, -3)}.out`), `${JSON.stringify(forecast(c))}\n`);
+const files = readdirSync(inputDir).filter(name => name.endsWith('.in')).sort();
+const cases = files.map(file => JSON.parse(readFileSync(join(inputDir, file), 'utf8')) as Case);
+if (process.argv.includes('--backtest')) {
+  // Explicit research mode; never runs during normal case processing. Each
+  // held-out launch contributes only its hour 1, release notes and prior rows.
+  const pool = [...new Map(cases.flatMap(c => c.comparables ?? [])
+    .map(c => [`${c.name}|${c.day_start}`, c])).values()];
+  const levels = [0.05, 0.25, 0.5, 0.75, 0.95];
+  let total = 0, items = 0, count = 0;
+  for (const comp of pool) {
+    const start = Date.parse(comp.day_start);
+    const actual = new Map(comp.hourly.map(r => [(Date.parse(r.from) - start) / HOUR, r.viewers]));
+    if (!actual.has(0) || /target-history|not a launch/i.test(comp.unlock)) {
+      console.log(`${comp.name}\tN/A (not a launch; no hour 1)`);
+      continue;
+    }
+    const out = forecast({ day_start: comp.day_start,
+      known: [{ hour: 1, viewers: actual.get(0)! }], notes: comp.unlock, platforms: comp.platforms,
+      history_hourly: comp.hourly.filter(r => Date.parse(r.from) < start),
+      comparables: pool.filter(c => c !== comp) });
+    let sum = 0, n = 0;
+    for (const row of out.hours) {
+      const y = actual.get(row.hour - 1);
+      if (y === undefined || !Number.isFinite(y)) continue;
+      row.q.forEach((q, j) => {
+        const d = Math.log(Math.max(1, y)) - Math.log(q);
+        sum += 2 * Math.max(levels[j] * d, (levels[j] - 1) * d);
+        n++;
+      });
+    }
+    console.log(`${comp.name}\t${n ? (sum / n).toFixed(6) : 'N/A'}\t${n / 5} hours`);
+    total += sum; items += n; if (n) count++;
+  }
+  for (const c of cases) {
+    if (c.game && !pool.some(comp => comp.name === c.game!.name)) {
+      console.log(`${c.game.name}\tN/A (practice answers withheld)`);
+    }
+  }
+  console.log(`Mean loss: ${items ? (total / items).toFixed(6) : 'N/A'}; ${count} launches; ${items} items`);
+} else {
+  mkdirSync(outputDir, { recursive: true });
+  files.forEach((file, i) => {
+    writeFileSync(join(outputDir, `${file.slice(0, -3)}.out`), `${JSON.stringify(forecast(cases[i]))}\n`);
+  });
 }
