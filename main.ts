@@ -23,6 +23,8 @@ interface Launch {
 const HOUR = 3600000;
 const Z = [-1.6448536269514722, -0.6744897501960817, 0,
   0.6744897501960817, 1.6448536269514722];
+// Calibrated by leave-one-out evaluation over the kit's comparables so the 90% interval is honest.
+const SIGMA_SCALE = 1.2;
 const clamp = (x: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, x));
 
 // A launch is an observation, not each of its hundreds of prelaunch rows.
@@ -63,7 +65,7 @@ function launches(c: Case): Launch[] {
     const first = values.get(0);
     if (!first || first < 100 || Array.from({ length: 24 }, (_, h) => values.has(h)).filter(Boolean).length < 18) continue;
     // Compare only information available before the forecast checkpoint.
-    // A broad kernel and a weight floor avoid selecting a single analogue.
+    // Tighter pre-launch similarity weighting, leave-one-out calibrated.
     let distance = 0;
     let observed = 0;
     for (const t of [-1, -2, -4, -8, -12]) {
@@ -73,7 +75,7 @@ function launches(c: Case): Launch[] {
       distance += Math.min(4, (a - Math.log(b / first)) ** 2);
       observed++;
     }
-    if (observed) weight *= 0.2 + 0.8 * Math.exp(-distance / observed / (2 * 0.6 ** 2));
+    if (observed) weight *= 0.2 + 0.8 * Math.exp(-distance / observed / (2 * 0.4 ** 2));
     const curve = Array.from({ length: 24 }, (_, h) => {
       const v = values.get(h);
       return v === undefined ? null : Math.log(v / first);
@@ -111,7 +113,7 @@ export function forecast(c: Case): { hours: Array<{ hour: number; q: number[] }>
     // Mild local pooling stabilizes variance without erasing unlock jumps.
     const variance = 0.6 * variances[h] + 0.2 * variances[Math.max(1, h - 1)]
       + 0.2 * variances[Math.min(23, h + 1)];
-    const sigma = Math.sqrt(Math.max(0.03 ** 2, variance));
+    const sigma = Math.sqrt(Math.max(0.03 ** 2, variance)) * SIGMA_SCALE;
     return { hour: h + 1, q: Z.map(z => Math.exp(clamp(anchor + means[h] + z * sigma, Math.log(0.01), Math.log(1e9)))) };
   });
   return { hours };
